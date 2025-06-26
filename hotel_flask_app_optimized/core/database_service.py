@@ -1,9 +1,6 @@
 """
-Hotel Booking System - Hybrid Database Service
-Zero-Risk PostgreSQL Migration with Google Sheets Fallback
-
-This service provides a unified interface that can seamlessly switch between
-PostgreSQL and Google Sheets, ensuring zero downtime during migration.
+Hotel Booking System - Pure PostgreSQL Database Service
+100% PostgreSQL - No Google Sheets dependencies
 """
 
 import os
@@ -14,52 +11,47 @@ from datetime import datetime, date
 from flask import current_app
 from contextlib import contextmanager
 import pandas as pd
+from sqlalchemy import text
 
-# Import models and existing Google Sheets logic
+# Import models only
 from .models import db, Guest, Booking, QuickNote, Expense, MessageTemplate, ArrivalTime
-from .logic import import_from_gsheet, append_multiple_bookings_to_sheet, update_row_in_gsheet
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # =====================================================
-# CONFIGURATION
+# CONFIGURATION - POSTGRESQL ONLY
 # =====================================================
 
 class DatabaseConfig:
-    """Database configuration and feature flags"""
+    """PostgreSQL-only database configuration"""
     
-    # Feature flags for gradual migration
-    USE_POSTGRESQL = os.getenv('USE_POSTGRESQL', 'false').lower() == 'true'
-    USE_HYBRID_MODE = os.getenv('USE_HYBRID_MODE', 'true').lower() == 'true'
-    
-    # Fallback behavior
-    FALLBACK_TO_SHEETS = os.getenv('FALLBACK_TO_SHEETS', 'true').lower() == 'true'
+    # PostgreSQL is the only backend
+    USE_POSTGRESQL = True
+    USE_HYBRID_MODE = False
+    FALLBACK_TO_SHEETS = False
     
     # Performance monitoring
     ENABLE_PERFORMANCE_LOGGING = os.getenv('ENABLE_PERFORMANCE_LOGGING', 'true').lower() == 'true'
     
-    # Google Sheets settings (existing)
-    GCP_CREDS_FILE_PATH = os.getenv('GCP_CREDS_FILE_PATH')
-    DEFAULT_SHEET_ID = os.getenv('DEFAULT_SHEET_ID')
-    WORKSHEET_NAME = os.getenv('WORKSHEET_NAME')
+    # PostgreSQL connection settings
+    DATABASE_URL = os.getenv('DATABASE_URL')
     
     @classmethod
     def get_primary_backend(cls):
         """Get the primary database backend"""
-        if cls.USE_POSTGRESQL:
-            return 'postgresql'
-        return 'google_sheets'
+        return 'postgresql'
     
     @classmethod
     def get_fallback_backend(cls):
-        """Get the fallback database backend"""
-        if cls.USE_POSTGRESQL and cls.FALLBACK_TO_SHEETS:
-            return 'google_sheets'
-        elif not cls.USE_POSTGRESQL:
-            return 'postgresql'
+        """No fallback - PostgreSQL only"""
         return None
+    
+    @classmethod
+    def get_use_postgresql(cls):
+        """Always use PostgreSQL"""
+        return True
 
 # =====================================================
 # PERFORMANCE MONITORING
@@ -82,8 +74,7 @@ class PerformanceTimer:
         duration = (self.end_time - self.start_time) * 1000  # Convert to milliseconds
         
         if DatabaseConfig.ENABLE_PERFORMANCE_LOGGING:
-            backend = DatabaseConfig.get_primary_backend()
-            logger.info(f"🚀 PERFORMANCE: {self.operation_name} ({backend}) - {duration:.1f}ms")
+            logger.info(f"PERFORMANCE: {self.operation_name} (PostgreSQL) - {duration:.1f}ms")
         
         return False
 
@@ -99,637 +90,462 @@ class PostgreSQLError(DatabaseError):
     """PostgreSQL specific error"""
     pass
 
-class GoogleSheetsError(DatabaseError):
-    """Google Sheets specific error"""
-    pass
-
 # =====================================================
-# DATA MAPPERS
+# PURE POSTGRESQL DATABASE SERVICE
 # =====================================================
 
-class DataMapper:
-    """Maps data between PostgreSQL and Google Sheets formats"""
-    
-    @staticmethod
-    def sheets_to_postgres_booking(sheets_row: Dict) -> Dict:
-        """Convert Google Sheets booking row to PostgreSQL format"""
-        try:
-            # Map Vietnamese column names to English
-            mapped = {
-                'booking_id': sheets_row.get('Số đặt phòng', ''),
-                'guest_name': sheets_row.get('Tên người đặt', ''),
-                'checkin_date': sheets_row.get('Check-in Date', ''),
-                'checkout_date': sheets_row.get('Check-out Date', ''),
-                'room_amount': float(sheets_row.get('Tổng thanh toán', 0) or 0),
-                'taxi_amount': float(sheets_row.get('Taxi', 0) or 0),
-                'commission': float(sheets_row.get('Hoa hồng', 0) or 0),
-                'collector': sheets_row.get('Người thu tiền', ''),
-                'booking_status': 'confirmed' if sheets_row.get('Tình trạng', '') == 'OK' else 'cancelled',
-                'payment_status': 'completed' if sheets_row.get('Người thu tiền') else 'pending',
-                'has_taxi': bool(sheets_row.get('Taxi', 0)),
-                'booking_notes': sheets_row.get('Ghi chú thanh toán', ''),
-            }
-            
-            # Convert dates
-            if mapped['checkin_date']:
-                mapped['checkin_date'] = pd.to_datetime(mapped['checkin_date']).date()
-            if mapped['checkout_date']:
-                mapped['checkout_date'] = pd.to_datetime(mapped['checkout_date']).date()
-            
-            return mapped
-        except Exception as e:
-            logger.error(f"Error mapping sheets to postgres: {e}")
-            raise DataMappingError(f"Failed to map sheets data: {e}")
-    
-    @staticmethod
-    def postgres_to_sheets_booking(booking: Union[Booking, Dict]) -> Dict:
-        """Convert PostgreSQL booking to Google Sheets format"""
-        try:
-            if isinstance(booking, Booking):
-                booking_dict = booking.to_dict()
-            else:
-                booking_dict = booking
-            
-            # Map English column names to Vietnamese
-            mapped = {
-                'Số đặt phòng': booking_dict.get('booking_id', ''),
-                'Tên người đặt': booking_dict.get('guest_name', ''),
-                'Tên chỗ nghỉ': '118 Hang Bac Hostel',
-                'Check-in Date': booking_dict.get('checkin_date', ''),
-                'Check-out Date': booking_dict.get('checkout_date', ''),
-                'Tổng thanh toán': booking_dict.get('room_amount', 0),
-                'Hoa hồng': booking_dict.get('commission', 0),
-                'Taxi': booking_dict.get('taxi_amount', 0),
-                'Người thu tiền': booking_dict.get('collector', ''),
-                'Tình trạng': 'OK' if booking_dict.get('booking_status') == 'confirmed' else 'Đã hủy',
-                'Ghi chú thanh toán': booking_dict.get('booking_notes', ''),
-                'Tiền tệ': 'VND',
-                'Vị trí': 'Hà Nội',
-                'Thành viên Genius': 'Không',
-            }
-            
-            return mapped
-        except Exception as e:
-            logger.error(f"Error mapping postgres to sheets: {e}")
-            raise DataMappingError(f"Failed to map postgres data: {e}")
-
-class DataMappingError(DatabaseError):
-    """Error in data mapping between formats"""
-    pass
-
-# =====================================================
-# HYBRID DATABASE SERVICE
-# =====================================================
-
-class HybridDatabaseService:
+class PostgreSQLDatabaseService:
     """
-    Unified database service that routes requests between PostgreSQL and Google Sheets
-    Provides zero-risk migration path with intelligent fallback
+    Pure PostgreSQL database service
+    All operations go directly to PostgreSQL
     """
     
     def __init__(self):
-        self.config = DatabaseConfig()
-        self.mapper = DataMapper()
+        self.backend_name = "PostgreSQL"
+        logger.info("PostgreSQL Database Service initialized")
     
-    @contextmanager
-    def performance_timer(self, operation_name: str):
-        """Context manager for performance monitoring"""
-        with PerformanceTimer(operation_name) as timer:
-            yield timer
+    def get_connection(self):
+        """Get PostgreSQL database connection"""
+        return db.engine.connect()
     
-    def _try_postgresql_operation(self, operation_func, *args, **kwargs):
-        """Try PostgreSQL operation with error handling"""
+    def test_connection(self) -> Dict[str, Any]:
+        """Test PostgreSQL connection"""
         try:
-            return operation_func(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"PostgreSQL operation failed: {e}")
-            raise PostgreSQLError(f"PostgreSQL error: {e}")
-    
-    def _try_sheets_operation(self, operation_func, *args, **kwargs):
-        """Try Google Sheets operation with error handling"""
-        try:
-            return operation_func(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"Google Sheets operation failed: {e}")
-            raise GoogleSheetsError(f"Google Sheets error: {e}")
-    
-    def _execute_with_fallback(self, primary_func, fallback_func, operation_name: str):
-        """Execute operation with fallback support"""
-        primary_backend = self.config.get_primary_backend()
-        fallback_backend = self.config.get_fallback_backend()
-        
-        with self.performance_timer(operation_name):
-            try:
-                # Try primary backend
-                if primary_backend == 'postgresql':
-                    return self._try_postgresql_operation(primary_func)
-                else:
-                    return self._try_sheets_operation(primary_func)
+            with PerformanceTimer("Connection Test"):
+                with self.get_connection() as conn:
+                    result = conn.execute(text("SELECT 1 as test")).fetchone()
                     
-            except Exception as e:
-                logger.warning(f"Primary backend ({primary_backend}) failed: {e}")
+            return {
+                'status': 'success',
+                'backend': 'postgresql',
+                'message': 'PostgreSQL connection successful',
+                'test_result': result[0] if result else None
+            }
+            
+        except Exception as e:
+            logger.error(f"PostgreSQL connection failed: {e}")
+            return {
+                'status': 'error',
+                'backend': 'postgresql', 
+                'message': f'PostgreSQL connection failed: {str(e)}'
+            }
+    
+    def get_all_bookings(self) -> List[Dict[str, Any]]:
+        """Get all bookings from PostgreSQL"""
+        try:
+            with PerformanceTimer("Get All Bookings"):
+                query = text("""
+                    SELECT 
+                        b.booking_id,
+                        g.full_name as guest_name,
+                        g.email,
+                        g.phone,
+                        b.checkin_date,
+                        b.checkout_date,
+                        b.room_amount,
+                        b.commission,
+                        b.taxi_amount,
+                        b.collector,
+                        b.booking_status,
+                        b.booking_notes,
+                        b.created_at,
+                        b.updated_at,
+                        CASE WHEN b.taxi_amount > 0 THEN true ELSE false END as has_taxi
+                    FROM bookings b
+                    JOIN guests g ON b.guest_id = g.guest_id
+                    WHERE b.booking_status != 'deleted'
+                    ORDER BY b.checkin_date DESC
+                """)
                 
-                # Try fallback if enabled
-                if fallback_backend and self.config.FALLBACK_TO_SHEETS:
-                    logger.info(f"Falling back to {fallback_backend}")
-                    try:
-                        if fallback_backend == 'google_sheets':
-                            return self._try_sheets_operation(fallback_func)
-                        else:
-                            return self._try_postgresql_operation(fallback_func)
-                    except Exception as fallback_error:
-                        logger.error(f"Fallback backend ({fallback_backend}) also failed: {fallback_error}")
-                        raise DatabaseError(f"Both primary and fallback failed: {e}, {fallback_error}")
-                else:
-                    raise DatabaseError(f"Primary backend failed and no fallback available: {e}")
+                with self.get_connection() as conn:
+                    result = conn.execute(query)
+                    bookings = [dict(row._mapping) for row in result]
+                
+                logger.info(f"Retrieved {len(bookings)} bookings from PostgreSQL")
+                return bookings
+                
+        except Exception as e:
+            logger.error(f"Error getting bookings: {e}")
+            raise PostgreSQLError(f"Failed to get bookings: {str(e)}")
     
-    # =====================================================
-    # BOOKING OPERATIONS
-    # =====================================================
-    
-    def get_all_bookings(self) -> List[Dict]:
-        """Get all bookings from the database"""
-        
-        def postgres_get_all():
-            bookings = Booking.query.join(Guest).all()
-            return [booking.to_dict() for booking in bookings]
-        
-        def sheets_get_all():
-            df = import_from_gsheet(
-                self.config.DEFAULT_SHEET_ID,
-                self.config.GCP_CREDS_FILE_PATH
-            )
-            bookings = []
-            for _, row in df.iterrows():
-                try:
-                    booking = self.mapper.sheets_to_postgres_booking(row.to_dict())
-                    bookings.append(booking)
-                except Exception as e:
-                    logger.warning(f"Skipping invalid booking row: {e}")
-                    continue
-            return bookings
-        
-        return self._execute_with_fallback(postgres_get_all, sheets_get_all, "get_all_bookings")
-    
-    def get_booking_by_id(self, booking_id: str) -> Optional[Dict]:
-        """Get a specific booking by ID"""
-        
-        def postgres_get_by_id():
-            booking = Booking.query.filter_by(booking_id=booking_id).join(Guest).first()
-            return booking.to_dict() if booking else None
-        
-        def sheets_get_by_id():
-            df = import_from_gsheet(
-                self.config.DEFAULT_SHEET_ID,
-                self.config.GCP_CREDS_FILE_PATH
-            )
-            booking_row = df[df['Số đặt phòng'] == booking_id]
-            if booking_row.empty:
-                return None
-            return self.mapper.sheets_to_postgres_booking(booking_row.iloc[0].to_dict())
-        
-        return self._execute_with_fallback(postgres_get_by_id, sheets_get_by_id, f"get_booking_by_id({booking_id})")
-    
-    def create_booking(self, booking_data: Dict) -> Dict:
-        """Create a new booking"""
-        
-        def postgres_create():
-            # First, create or get guest
-            guest = Guest.query.filter_by(full_name=booking_data['guest_name']).first()
-            if not guest:
-                guest = Guest(
-                    full_name=booking_data['guest_name'],
-                    email=booking_data.get('email'),
-                    phone=booking_data.get('phone')
+    def create_booking(self, booking_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create new booking in PostgreSQL"""
+        try:
+            with PerformanceTimer("Create Booking"):
+                # Check if guest exists
+                guest = db.session.query(Guest).filter_by(
+                    full_name=booking_data.get('guest_name', ''),
+                    email=booking_data.get('email', '')
+                ).first()
+                
+                if not guest:
+                    # Create new guest
+                    guest = Guest(
+                        full_name=booking_data.get('guest_name', ''),
+                        email=booking_data.get('email', ''),
+                        phone=booking_data.get('phone', ''),
+                        nationality=booking_data.get('nationality', ''),
+                        passport_number=booking_data.get('passport_number', '')
+                    )
+                    db.session.add(guest)
+                    db.session.flush()
+                
+                # Create new booking
+                booking = Booking(
+                    booking_id=booking_data.get('booking_id', ''),
+                    guest_id=guest.guest_id,
+                    checkin_date=booking_data.get('checkin_date'),
+                    checkout_date=booking_data.get('checkout_date'),
+                    room_amount=booking_data.get('room_amount', 0),
+                    commission=booking_data.get('commission', 0),
+                    taxi_amount=booking_data.get('taxi_amount', 0),
+                    collector=booking_data.get('collector', ''),
+                    booking_status='confirmed',
+                    booking_notes=booking_data.get('notes', '')
                 )
-                db.session.add(guest)
-                db.session.flush()
-            
-            # Create booking
-            booking = Booking(
-                booking_id=booking_data['booking_id'],
-                guest_id=guest.guest_id,
-                checkin_date=booking_data['checkin_date'],
-                checkout_date=booking_data['checkout_date'],
-                room_amount=booking_data.get('room_amount', 0),
-                taxi_amount=booking_data.get('taxi_amount', 0),
-                commission=booking_data.get('commission', 0),
-                collector=booking_data.get('collector'),
-                booking_status=booking_data.get('booking_status', 'confirmed'),
-                payment_status=booking_data.get('payment_status', 'pending'),
-                has_taxi=booking_data.get('has_taxi', False),
-                booking_notes=booking_data.get('booking_notes', ''),
-            )
-            
-            db.session.add(booking)
-            db.session.commit()
-            return booking.to_dict()
-        
-        def sheets_create():
-            # Convert to sheets format
-            sheets_data = self.mapper.postgres_to_sheets_booking(booking_data)
-            
-            # Append to sheets
-            append_multiple_bookings_to_sheet(
-                [sheets_data],
-                self.config.DEFAULT_SHEET_ID,
-                self.config.GCP_CREDS_FILE_PATH
-            )
-            
-            return booking_data
-        
-        return self._execute_with_fallback(postgres_create, sheets_create, f"create_booking({booking_data.get('booking_id')})")
+                
+                db.session.add(booking)
+                db.session.commit()
+                
+                logger.info(f"Created booking: {booking_data.get('booking_id')}")
+                
+                return {
+                    'status': 'success',
+                    'booking_id': booking.booking_id,
+                    'message': 'Booking created successfully'
+                }
+                
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error creating booking: {e}")
+            raise PostgreSQLError(f"Failed to create booking: {str(e)}")
     
-    def update_booking(self, booking_id: str, update_data: Dict) -> Dict:
-        """Update an existing booking"""
-        
-        def postgres_update():
-            # DEBUG: Print update data for booking 4792449210
-            if booking_id == '4792449210':
-                print(f"🔍 [DATABASE_SERVICE] Updating booking {booking_id}")
-                print(f"   Update data received: {update_data}")
-                for key, value in update_data.items():
-                    print(f"   {key}: {value} (type: {type(value)})")
-            
-            booking = Booking.query.filter_by(booking_id=booking_id).first()
-            if not booking:
-                raise ValueError(f"Booking {booking_id} not found")
-            
-            # Update fields
-            for key, value in update_data.items():
-                if hasattr(booking, key):
-                    if booking_id == '4792449210' and key == 'commission':
-                        print(f"🔍 [DATABASE_SERVICE] Setting commission: {value} (type: {type(value)})")
-                    setattr(booking, key, value)
-            
-            db.session.commit()
-            
-            # DEBUG: Verify commission was set
-            if booking_id == '4792449210':
-                updated_booking = booking.to_dict()
-                print(f"🔍 [DATABASE_SERVICE] After update, commission = {updated_booking.get('commission')}")
-            
-            return booking.to_dict()
-        
-        def sheets_update():
-            # Get current data
-            df = import_from_gsheet(
-                self.config.DEFAULT_SHEET_ID,
-                self.config.GCP_CREDS_FILE_PATH
-            )
-            
-            # Find row to update
-            row_index = df[df['Số đặt phòng'] == booking_id].index
-            if row_index.empty:
-                raise ValueError(f"Booking {booking_id} not found in sheets")
-            
-            # Update row
-            sheets_update_data = self.mapper.postgres_to_sheets_booking(update_data)
-            update_row_in_gsheet(
-                self.config.DEFAULT_SHEET_ID,
-                self.config.GCP_CREDS_FILE_PATH,
-                self.config.WORKSHEET_NAME,  # Use worksheet name, not row index
-                booking_id,  # Pass booking_id to find the row
-                sheets_update_data  # Pass update data as new_data parameter
-            )
-            
-            return update_data
-        
-        return self._execute_with_fallback(postgres_update, sheets_update, f"update_booking({booking_id})")
+    def update_booking(self, booking_id: str, update_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Update booking in PostgreSQL"""
+        try:
+            with PerformanceTimer("Update Booking"):
+                booking = db.session.query(Booking).filter_by(booking_id=booking_id).first()
+                
+                if not booking:
+                    return {
+                        'status': 'error',
+                        'message': f'Booking {booking_id} not found'
+                    }
+                
+                # Update guest info if provided
+                if any(key in update_data for key in ['guest_name', 'email', 'phone']):
+                    guest = booking.guest
+                    if 'guest_name' in update_data:
+                        guest.full_name = update_data['guest_name']
+                    if 'email' in update_data:
+                        guest.email = update_data['email']
+                    if 'phone' in update_data:
+                        guest.phone = update_data['phone']
+                
+                # Update booking info
+                for field, value in update_data.items():
+                    if hasattr(booking, field):
+                        setattr(booking, field, value)
+                
+                # Map common field names
+                field_mapping = {
+                    'checkin_date': 'checkin_date',
+                    'checkout_date': 'checkout_date', 
+                    'room_amount': 'room_amount',
+                    'commission': 'commission',
+                    'taxi_amount': 'taxi_amount',
+                    'collector': 'collector',
+                    'notes': 'booking_notes',
+                    'status': 'booking_status'
+                }
+                
+                for old_field, new_field in field_mapping.items():
+                    if old_field in update_data:
+                        setattr(booking, new_field, update_data[old_field])
+                
+                db.session.commit()
+                
+                logger.info(f"Updated booking: {booking_id}")
+                
+                return {
+                    'status': 'success',
+                    'booking_id': booking_id,
+                    'message': 'Booking updated successfully'
+                }
+                
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error updating booking: {e}")
+            raise PostgreSQLError(f"Failed to update booking: {str(e)}")
     
-    def delete_booking(self, booking_id: str) -> bool:
-        """Delete a booking"""
-        
-        def postgres_delete():
-            booking = Booking.query.filter_by(booking_id=booking_id).first()
-            if not booking:
-                return False
-            
-            db.session.delete(booking)
-            db.session.commit()
-            return True
-        
-        def sheets_delete():
-            # For Google Sheets, we'll mark as cancelled instead of deleting
-            return self.update_booking(booking_id, {'booking_status': 'cancelled'})
-        
-        return self._execute_with_fallback(postgres_delete, sheets_delete, f"delete_booking({booking_id})")
+    def delete_booking(self, booking_id: str) -> Dict[str, Any]:
+        """Delete booking from PostgreSQL (soft delete)"""
+        try:
+            with PerformanceTimer("Delete Booking"):
+                booking = db.session.query(Booking).filter_by(booking_id=booking_id).first()
+                
+                if not booking:
+                    return {
+                        'status': 'error', 
+                        'message': f'Booking {booking_id} not found'
+                    }
+                
+                # Soft delete
+                booking.booking_status = 'deleted'
+                db.session.commit()
+                
+                logger.info(f"Deleted booking: {booking_id}")
+                
+                return {
+                    'status': 'success',
+                    'booking_id': booking_id,
+                    'message': 'Booking deleted successfully'
+                }
+                
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error deleting booking: {e}")
+            raise PostgreSQLError(f"Failed to delete booking: {str(e)}")
     
-    # =====================================================
-    # DASHBOARD OPERATIONS
-    # =====================================================
+    def get_expenses(self) -> List[Dict[str, Any]]:
+        """Get all expenses from PostgreSQL"""
+        try:
+            with PerformanceTimer("Get Expenses"):
+                query = text("""
+                    SELECT 
+                        expense_id,
+                        expense_date,
+                        amount,
+                        description,
+                        category,
+                        collector,
+                        created_at
+                    FROM expenses
+                    ORDER BY expense_date DESC
+                """)
+                
+                with self.get_connection() as conn:
+                    result = conn.execute(query)
+                    expenses = [dict(row._mapping) for row in result]
+                
+                return expenses
+                
+        except Exception as e:
+            logger.error(f"Error getting expenses: {e}")
+            raise PostgreSQLError(f"Failed to get expenses: {str(e)}")
     
-    def get_dashboard_data(self) -> Dict:
-        """Get dashboard analytics data"""
-        
-        def postgres_dashboard():
-            today = date.today()
-            
-            # Get statistics
-            total_bookings = Booking.query.filter(Booking.booking_status != 'deleted').count()
-            active_bookings = Booking.query.filter(
-                Booking.booking_status.in_(['confirmed', 'checked_in'])
-            ).count()
-            
-            # Today's arrivals
-            todays_arrivals = Booking.query.filter(
-                Booking.checkin_date == today,
-                Booking.booking_status == 'confirmed'
-            ).join(Guest).all()
-            
-            # Overdue payments
-            overdue_payments = Booking.query.filter(
-                Booking.checkin_date <= today,
-                Booking.payment_status != 'completed',
-                Booking.booking_status != 'cancelled'
-            ).join(Guest).all()
-            
-            return {
-                'total_bookings': total_bookings,
-                'active_bookings': active_bookings,
-                'todays_arrivals': [booking.to_dict() for booking in todays_arrivals],
-                'overdue_payments': [booking.to_dict() for booking in overdue_payments],
-                'performance_backend': 'postgresql'
-            }
-        
-        def sheets_dashboard():
-            # Existing dashboard logic from dashboard_routes.py
-            from dashboard_routes import process_overdue_guests
-            
-            df = import_from_gsheet(
-                self.config.DEFAULT_SHEET_ID,
-                self.config.GCP_CREDS_FILE_PATH
-            )
-            
-            # Process data (simplified version)
-            total_bookings = len(df)
-            active_bookings = len(df[df['Tình trạng'] == 'OK'])
-            
-            # Get overdue guests
-            overdue_data = process_overdue_guests(df)
-            
-            return {
-                'total_bookings': total_bookings,
-                'active_bookings': active_bookings,
-                'overdue_payments': overdue_data.get('overdue_guests', []),
-                'todays_arrivals': [],  # Would need to implement
-                'performance_backend': 'google_sheets'
-            }
-        
-        return self._execute_with_fallback(postgres_dashboard, sheets_dashboard, "get_dashboard_data")
+    def create_expense(self, expense_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create expense in PostgreSQL"""
+        try:
+            with PerformanceTimer("Create Expense"):
+                expense = Expense(
+                    expense_date=expense_data.get('date'),
+                    amount=expense_data.get('amount', 0),
+                    description=expense_data.get('description', ''),
+                    category=expense_data.get('category', 'general'),
+                    collector=expense_data.get('collector', '')
+                )
+                
+                db.session.add(expense)
+                db.session.commit()
+                
+                return {
+                    'status': 'success',
+                    'expense_id': expense.expense_id,
+                    'message': 'Expense created successfully'
+                }
+                
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error creating expense: {e}")
+            raise PostgreSQLError(f"Failed to create expense: {str(e)}")
     
     # =====================================================
-    # QUICK NOTES OPERATIONS
+    # QUICK NOTES METHODS
     # =====================================================
     
-    def get_quick_notes(self, completed: Optional[bool] = None) -> List[Dict]:
-        """Get quick notes"""
-        
-        def postgres_get_notes():
-            query = QuickNote.query
-            if completed is not None:
-                query = query.filter(QuickNote.completed == completed)
-            notes = query.order_by(QuickNote.created_at.desc()).all()
-            return [note.to_dict() for note in notes]
-        
-        def sheets_get_notes():
-            # Existing quick notes logic from logic.py
-            # This would need to be implemented based on current sheets structure
+    def get_quick_notes(self) -> List[QuickNote]:
+        """Get all quick notes"""
+        try:
+            return db.session.query(QuickNote).filter_by(is_completed=False).order_by(QuickNote.created_at.desc()).all()
+        except Exception as e:
+            logger.error(f"Error getting quick notes: {e}")
             return []
-        
-        return self._execute_with_fallback(postgres_get_notes, sheets_get_notes, f"get_quick_notes(completed={completed})")
     
-    def create_quick_note(self, note_data: Dict) -> Dict:
-        """Create a quick note"""
-        
-        def postgres_create_note():
+    def get_quick_note(self, note_id: int) -> Optional[QuickNote]:
+        """Get specific quick note by ID"""
+        try:
+            return db.session.query(QuickNote).filter_by(note_id=note_id).first()
+        except Exception as e:
+            logger.error(f"Error getting quick note {note_id}: {e}")
+            return None
+    
+    def create_quick_note(self, note_type: str, content: str, guest_name: str = None, 
+                         booking_id: str = None, priority: str = 'normal') -> QuickNote:
+        """Create new quick note"""
+        try:
             note = QuickNote(
-                note_id=note_data.get('note_id', int(time.time() * 1000)),
-                note_type=note_data['note_type'],
-                content=note_data['content'],
-                guest_name=note_data.get('guest_name'),
-                booking_id=note_data.get('booking_id'),
-                reminder_date=note_data.get('reminder_date'),
-                reminder_time=note_data.get('reminder_time'),
-                priority=note_data.get('priority', 'normal')
+                note_type=note_type,
+                note_content=content,  # Use correct column name
+                created_by=guest_name  # Map guest_name to created_by
             )
-            
             db.session.add(note)
             db.session.commit()
-            return note.to_dict()
-        
-        def sheets_create_note():
-            # Use existing sheets logic for quick notes
-            return note_data
-        
-        return self._execute_with_fallback(postgres_create_note, sheets_create_note, "create_quick_note")
+            return note
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error creating quick note: {e}")
+            raise PostgreSQLError(f"Failed to create quick note: {str(e)}")
+    
+    def update_quick_note(self, note_id: int, data: Dict[str, Any]) -> Optional[QuickNote]:
+        """Update quick note"""
+        try:
+            note = db.session.query(QuickNote).filter_by(note_id=note_id).first()
+            if not note:
+                return None
+            
+            for key, value in data.items():
+                if hasattr(note, key):
+                    setattr(note, key, value)
+            
+            db.session.commit()
+            return note
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error updating quick note {note_id}: {e}")
+            raise PostgreSQLError(f"Failed to update quick note: {str(e)}")
+    
+    def delete_quick_note(self, note_id: int) -> bool:
+        """Delete quick note"""
+        try:
+            note = db.session.query(QuickNote).filter_by(note_id=note_id).first()
+            if not note:
+                return False
+            
+            db.session.delete(note)
+            db.session.commit()
+            return True
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error deleting quick note {note_id}: {e}")
+            return False
     
     # =====================================================
-    # HEALTH CHECK & MONITORING
+    # ARRIVAL TIMES METHODS
     # =====================================================
     
-    def health_check(self) -> Dict:
-        """Check health of both backends"""
-        health_status = {
-            'timestamp': datetime.now().isoformat(),
-            'primary_backend': self.config.get_primary_backend(),
-            'fallback_backend': self.config.get_fallback_backend(),
-            'postgresql': {'status': 'unknown', 'response_time': None, 'error': None},
-            'google_sheets': {'status': 'unknown', 'response_time': None, 'error': None}
-        }
-        
-        # Test PostgreSQL
+    def get_arrival_times(self) -> List[ArrivalTime]:
+        """Get all arrival times"""
         try:
-            with PerformanceTimer("health_check_postgresql") as timer:
-                guest_count = Guest.query.count()
-            health_status['postgresql'] = {
-                'status': 'healthy',
-                'response_time': f"{(timer.end_time - timer.start_time) * 1000:.1f}ms",
-                'guest_count': guest_count,
-                'error': None
-            }
+            return db.session.query(ArrivalTime).all()
         except Exception as e:
-            health_status['postgresql'] = {
-                'status': 'error',
-                'response_time': None,
-                'error': str(e)
-            }
-        
-        # Test Google Sheets
-        try:
-            with PerformanceTimer("health_check_sheets") as timer:
-                df = import_from_gsheet(
-                    self.config.DEFAULT_SHEET_ID,
-                    self.config.GCP_CREDS_FILE_PATH
-                )
-            health_status['google_sheets'] = {
-                'status': 'healthy',
-                'response_time': f"{(timer.end_time - timer.start_time) * 1000:.1f}ms",
-                'booking_count': len(df),
-                'error': None
-            }
-        except Exception as e:
-            health_status['google_sheets'] = {
-                'status': 'error',
-                'response_time': None,
-                'error': str(e)
-            }
-        
-        return health_status
+            logger.error(f"Error getting arrival times: {e}")
+            return []
     
-    def get_performance_stats(self) -> Dict:
-        """Get performance comparison between backends"""
-        return {
-            'config': {
-                'primary_backend': self.config.get_primary_backend(),
-                'fallback_backend': self.config.get_fallback_backend(),
-                'use_postgresql': self.config.USE_POSTGRESQL,
-                'use_hybrid_mode': self.config.USE_HYBRID_MODE,
-                'fallback_to_sheets': self.config.FALLBACK_TO_SHEETS
-            },
-            'health_check': self.health_check()
-        }
+    def upsert_arrival_time(self, booking_id: str, estimated_arrival: str = None, 
+                           notes: str = None) -> ArrivalTime:
+        """Create or update arrival time"""
+        try:
+            arrival_time = db.session.query(ArrivalTime).filter_by(booking_id=booking_id).first()
+            
+            if not arrival_time:
+                arrival_time = ArrivalTime(booking_id=booking_id)
+                db.session.add(arrival_time)
+            
+            if estimated_arrival:
+                from datetime import datetime
+                arrival_time.arrival_time = datetime.strptime(estimated_arrival, '%H:%M').time()  # Use correct column name
+            
+            if notes:
+                arrival_time.notes = notes  # Use correct column name
+            
+            db.session.commit()
+            return arrival_time
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error upserting arrival time: {e}")
+            raise PostgreSQLError(f"Failed to upsert arrival time: {str(e)}")
+    
+    def get_health_status(self) -> Dict[str, Any]:
+        """Get PostgreSQL health status"""
+        try:
+            connection_test = self.test_connection()
+            
+            # Get database stats
+            with self.get_connection() as conn:
+                booking_count = conn.execute(text("SELECT COUNT(*) FROM bookings WHERE booking_status != 'deleted'")).scalar()
+                guest_count = conn.execute(text("SELECT COUNT(*) FROM guests")).scalar()
+                expense_count = conn.execute(text("SELECT COUNT(*) FROM expenses")).scalar()
+            
+            return {
+                'status': 'healthy',
+                'backend': 'postgresql',
+                'connection': connection_test['status'],
+                'stats': {
+                    'bookings': booking_count,
+                    'guests': guest_count,
+                    'expenses': expense_count
+                },
+                'features': {
+                    'crud_operations': True,
+                    'performance_monitoring': True,
+                    'data_integrity': True
+                }
+            }
+            
+        except Exception as e:
+            return {
+                'status': 'unhealthy',
+                'backend': 'postgresql',
+                'error': str(e)
+            }
 
 # =====================================================
-# GLOBAL SERVICE INSTANCE
+# SERVICE INSTANCE AND HELPER FUNCTIONS
 # =====================================================
 
 # Global service instance
-db_service = HybridDatabaseService()
-
-# =====================================================
-# FLASK ROUTE HELPERS
-# =====================================================
-
-def get_database_service() -> HybridDatabaseService:
-    """Get the global database service instance"""
-    return db_service
+_database_service = None
 
 def init_database_service(app):
-    """Initialize the database service with Flask app"""
-    global db_service
+    """Initialize the PostgreSQL database service"""
+    global _database_service
     
-    # Initialize models
-    from models import init_db
-    init_db(app)
+    # Initialize SQLAlchemy with the app
+    db.init_app(app)
     
-    # Create tables if using PostgreSQL
-    if DatabaseConfig.USE_POSTGRESQL:
+    # Create database service
+    _database_service = PostgreSQLDatabaseService()
+    
+    # Create tables if they don't exist
+    with app.app_context():
         try:
-            from models import create_all_tables
-            create_all_tables(app)
-            logger.info("✅ PostgreSQL tables initialized")
+            db.create_all()
+            logger.info("Database tables created/verified")
         except Exception as e:
-            logger.error(f"❌ Failed to initialize PostgreSQL tables: {e}")
+            logger.error(f"Error creating database tables: {e}")
     
-    logger.info(f"🚀 Hybrid Database Service initialized - Primary: {DatabaseConfig.get_primary_backend()}")
-    return db_service
+    logger.info("PostgreSQL Database Service initialized successfully")
+
+def get_database_service() -> PostgreSQLDatabaseService:
+    """Get the database service instance"""
+    global _database_service
+    
+    if _database_service is None:
+        raise RuntimeError("Database service not initialized. Call init_database_service() first.")
+    
+    return _database_service
 
 # =====================================================
-# EXPENSES OPERATIONS
+# COMPATIBILITY FUNCTIONS
 # =====================================================
 
-def get_expenses_from_postgresql():
-    """Get all expenses from PostgreSQL"""
-    try:
-        from models import Expense
-        expenses = Expense.query.order_by(Expense.created_at.desc()).all()
-        
-        # Convert to format expected by frontend
-        expense_list = []
-        for expense in expenses:
-            expense_list.append({
-                'date': expense.expense_date.strftime('%Y-%m-%d'),
-                'description': expense.description,
-                'amount': float(expense.amount),
-                'created_at': expense.created_at.strftime('%Y-%m-%d %H:%M:%S') if expense.created_at else ''
-            })
-        
-        return expense_list
-    except Exception as e:
-        print(f"Error getting expenses from PostgreSQL: {e}")
-        return []
+def get_use_postgresql() -> bool:
+    """Always return True - PostgreSQL only"""
+    return True
 
-def add_expense_to_postgresql(expense_data):
-    """Add expense to PostgreSQL"""
-    try:
-        from models import db, Expense
-        from datetime import datetime
-        
-        expense = Expense(
-            expense_date=datetime.strptime(expense_data['date'], '%Y-%m-%d').date(),
-            description=expense_data['description'],
-            amount=float(expense_data['amount']),
-            category=expense_data.get('category', 'general'),
-            receipt_url=expense_data.get('receipt_url', ''),
-            created_at=datetime.now(),
-            updated_at=datetime.now()
-        )
-        
-        db.session.add(expense)
-        db.session.commit()
-        return True
-    except Exception as e:
-        print(f"Error adding expense to PostgreSQL: {e}")
-        return False
+def get_primary_backend() -> str:
+    """Always return postgresql"""
+    return 'postgresql'
 
-# =====================================================
-# MESSAGE TEMPLATES OPERATIONS  
-# =====================================================
-
-def get_message_templates_from_postgresql():
-    """Get all message templates from PostgreSQL"""
-    try:
-        from models import MessageTemplate
-        templates = MessageTemplate.query.filter_by(active=True).order_by(MessageTemplate.category, MessageTemplate.label).all()
-        
-        # Convert to format expected by frontend
-        template_list = []
-        for template in templates:
-            template_list.append({
-                'category': template.category,
-                'title': template.label,  # Map label to title for compatibility
-                'content': template.message_text  # Map message_text to content for compatibility
-            })
-        
-        return template_list
-    except Exception as e:
-        print(f"Error getting templates from PostgreSQL: {e}")
-        return []
-
-def save_message_template_to_postgresql(template_data):
-    """Save message template to PostgreSQL"""
-    try:
-        from models import db, MessageTemplate
-        from datetime import datetime
-        
-        template = MessageTemplate(
-            category=template_data['category'],
-            label=template_data['title'],  # Map title to label
-            message_text=template_data['content'],  # Map content to message_text
-            active=True,
-            created_at=datetime.now(),
-            updated_at=datetime.now()
-        )
-        
-        db.session.add(template)
-        db.session.commit()
-        return True
-    except Exception as e:
-        print(f"Error saving template to PostgreSQL: {e}")
-        return False
-
-def delete_message_template_from_postgresql(template_title):
-    """Delete message template from PostgreSQL"""
-    try:
-        from models import db, MessageTemplate
-        
-        template = MessageTemplate.query.filter_by(label=template_title).first()
-        if template:
-            db.session.delete(template)
-            db.session.commit()
-            return True
-        return False
-    except Exception as e:
-        print(f"Error deleting template from PostgreSQL: {e}")
-        return False
+print("Pure PostgreSQL Database Service loaded successfully")
